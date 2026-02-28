@@ -515,14 +515,54 @@ def _create_debug_logger(
     return DebugLogger(enabled=True, log_path=debug_log_path)
 
 
+def _compute_end_datetime(
+    start_dt: datetime,
+    rollout_steps: int,
+    time_delta_target_minutes: int,
+) -> datetime:
+    """Compute end_datetime from start and rollout steps.
+
+    Formula: end = start + (rollout_steps + 2) * target_delta
+
+    This ensures we have enough files for:
+    - 2 input frames (at start and start + target_delta)
+    - rollout_steps + 1 prediction targets
+
+    Example with rollout_steps=3, target_delta=60min, start=10:00:
+    - Inputs: 10:00, 11:00
+    - Targets: 12:00, 13:00, 14:00, 15:00 (4 predictions)
+    - End: 15:00 = 10:00 + 5*60 = start + (3+2)*60
+    - Files: 10, 11, 12, 13, 14, 15 = 6 files
+    """
+    total_minutes = (rollout_steps + 2) * time_delta_target_minutes
+    return start_dt + timedelta(minutes=total_minutes)
+
+
 def _select_dates(
     user_cfg: dict[str, Any],
+    advanced_cfg: dict[str, Any],
     cli_start: str | None,
     cli_end: str | None,
+    rollout_steps: int,
     use_prompt: bool,
 ) -> tuple[datetime, datetime]:
     start_dt = _parse_datetime(cli_start) if cli_start else _parse_datetime(user_cfg["start_datetime"])
-    end_dt = _parse_datetime(cli_end) if cli_end else _parse_datetime(user_cfg["end_datetime"])
+
+    # end_datetime is now optional - auto-calculate if not provided
+    end_dt = None
+    if cli_end:
+        end_dt = _parse_datetime(cli_end)
+    elif user_cfg.get("end_datetime"):
+        try:
+            end_dt = _parse_datetime(user_cfg["end_datetime"])
+        except (ValueError, TypeError):
+            pass
+
+    # Auto-calculate end_datetime if not provided
+    if end_dt is None:
+        target_delta = int(advanced_cfg.get("time_delta_target_minutes", 60))
+        end_dt = _compute_end_datetime(start_dt, rollout_steps, target_delta)
+
     if use_prompt:
         print("\nEnter download window in UTC (press Enter to keep defaults).")
         start_dt = _prompt_datetime("Start datetime", start_dt)
@@ -1789,15 +1829,21 @@ def main() -> int:
 
     user_cfg, advanced_cfg = _load_easy_sections(config_path)
     prompt_for_dates = bool(user_cfg["prompt_for_dates"]) and (not args.no_prompt)
-    start_dt, end_dt = _select_dates(
-        user_cfg=user_cfg,
-        cli_start=args.start_datetime,
-        cli_end=args.end_datetime,
-        use_prompt=prompt_for_dates,
-    )
+
+    # Select rollout_steps first (needed for auto-calculating end_datetime)
     rollout_steps = _select_rollout_steps(
         user_cfg=user_cfg,
         cli_rollout_steps=args.rollout_steps,
+        use_prompt=prompt_for_dates,
+    )
+
+    # Select dates (end_datetime auto-calculated if not provided)
+    start_dt, end_dt = _select_dates(
+        user_cfg=user_cfg,
+        advanced_cfg=advanced_cfg,
+        cli_start=args.start_datetime,
+        cli_end=args.end_datetime,
+        rollout_steps=rollout_steps,
         use_prompt=prompt_for_dates,
     )
 

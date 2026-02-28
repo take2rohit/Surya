@@ -7,7 +7,10 @@ user:
   start_datetime: "2014-10-23 10:00:00"
   # Inclusive UTC end datetime for the download/inference window.
   # Format: YYYY-MM-DD HH:MM[:SS]
-  end_datetime: "2014-10-23 17:00:00"
+  # OPTIONAL: If not provided, auto-calculated from start_datetime and rollout_steps.
+  # Formula: end = start + (rollout_steps + 2) * target_delta_minutes
+  # Example: start=10:00, rollout_steps=3, target_delta=60 -> end=15:00 (6 files)
+  end_datetime: ""  # Leave empty to auto-calculate
   # If true, prompt in terminal to confirm/override start/end datetime and rollout steps.
   prompt_for_dates: true
   # Directory where run artifacts are written (prediction.nc, metrics CSV/JSON).
