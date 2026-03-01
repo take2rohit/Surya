@@ -1560,13 +1560,26 @@ def _run_single_sample_rollout(
 
                     if step_loss is not None:
                         step_losses.append(step_loss)
-                    loss_text = f"loss={step_loss:.6f}" if step_loss is not None else "GT skipped"
                     output_label = output_labels[step]
                     step_input_labels = list(window_labels)
+
+                    # Human-readable progress line
+                    def _fmt_label(lbl: str) -> str:
+                        """'GT_2016-10-12T20:00:00' -> 'GT Oct 12 20:00'."""
+                        from datetime import datetime as _dt
+                        try:
+                            ts = _dt.fromisoformat(lbl.split("_", 1)[-1] if lbl.startswith("GT_") else lbl.rsplit("_", 1)[-1])
+                            tag = "GT" if lbl.startswith("GT_") else "Pred"
+                            return f"{tag} {ts.strftime('%b %d %H:%M')}"
+                        except Exception:
+                            return lbl
+
+                    inputs_str = ", ".join(_fmt_label(l) for l in window_labels)
+                    out_str = _fmt_label(output_label)
+                    loss_str = f"  MSE={step_loss:.2f}" if step_loss is not None else "  (no GT)"
                     log_progress(
                         show_progress,
-                        f"infer step {step + 1}/{prediction_steps} | "
-                        f"in={_format_items_for_log(window_labels, max_items=32)} -> out={output_label} | {loss_text}",
+                        f"Step {step + 1}/{prediction_steps}  [{inputs_str}] -> {out_str}{loss_str}",
                     )
 
                     # Wait for previous write to finish before submitting new one

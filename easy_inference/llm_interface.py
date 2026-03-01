@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Surya Easy Inference - Natural Language Interface with LLM Support
+Surya Easy Inference - Natural Language Interface with GPT-OSS
 
 A terminal interface for running solar predictions and analysis
-using natural language. Supports local Ollama or cloud Groq API.
+using natural language. Uses GPT-OSS on GPU with Harmony format.
 
 Usage:
-    python llm_interface.py                # Auto-detect (Ollama first, then Groq)
-    python llm_interface.py --ollama       # Use local Ollama
-    python llm_interface.py --groq         # Use Groq API
-    python llm_interface.py --model llama3.2:3b  # Specify model
+    python llm_interface.py                # Default (GPT-OSS-120B)
+    python llm_interface.py --model gpt-oss-20b  # GPT-OSS 20B (single GPU)
     python llm_interface.py --no-llm       # Disable LLM (regex only)
 
 Commands:
@@ -23,18 +21,12 @@ Commands:
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
+from typing import Any, Generator
 
 # Constants
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -89,203 +81,383 @@ class SessionLogger:
         return str(self.log_file)
 
 
-class OllamaClient:
-    """Client for local Ollama LLM."""
+AVAILABLE_MODELS = [
+    {"name": "GPT-OSS-20B",  "hf_id": "openai/gpt-oss-20b",  "reasoning": "low",    "desc": "Fast, single GPU"},
+    {"name": "GPT-OSS-20B",  "hf_id": "openai/gpt-oss-20b",  "reasoning": "medium", "desc": "Balanced, single GPU"},
+    {"name": "GPT-OSS-20B",  "hf_id": "openai/gpt-oss-20b",  "reasoning": "high",   "desc": "Deep reasoning, single GPU"},
+    {"name": "GPT-OSS-120B", "hf_id": "openai/gpt-oss-120b", "reasoning": "low",    "desc": "Fast, minimal thinking"},
+    {"name": "GPT-OSS-120B", "hf_id": "openai/gpt-oss-120b", "reasoning": "medium", "desc": "Balanced"},
+    {"name": "GPT-OSS-120B", "hf_id": "openai/gpt-oss-120b", "reasoning": "high",   "desc": "Deep reasoning"},
+]
 
-    DEFAULT_MODEL = "gpt-oss-120b"
-    FALLBACK_MODELS = ["llama3.1:8b", "llama3.2:3b", "llama3.2:1b", "mistral:7b", "qwen2.5:7b"]
 
-    def __init__(self, model: str | None = None, host: str = "http://localhost:11434"):
-        self.host = host
-        self.model = model
-        self.available = False
-        self._check_connection()
+def _is_model_cached(hf_id: str) -> bool:
+    """Check if a HuggingFace model is already downloaded locally."""
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub"
+    model_dir = cache_dir / f"models--{hf_id.replace('/', '--')}"
+    if not model_dir.exists():
+        return False
+    snapshots = model_dir / "snapshots"
+    return snapshots.exists() and any(snapshots.iterdir())
 
-    def _check_connection(self):
-        """Check if Ollama is running and find available model."""
-        import urllib.request
-        import urllib.error
 
+def select_model() -> tuple[str, str] | None:
+    """Show interactive model selection menu. Returns (hf_id, reasoning) or None."""
+    print("\n  Available Modes:")
+    print("  " + "-" * 70)
+    print(f"  {'#':>3}  {'Model':<14} {'Reasoning':<10} {'Description':<24} {'Cached':<8}")
+    print("  " + "-" * 70)
+
+    for i, m in enumerate(AVAILABLE_MODELS, 1):
+        cached = "yes" if _is_model_cached(m["hf_id"]) else ""
+        default = " (default)" if i == 1 else ""
+        print(f"  {i:>3}  {m['name']:<14} {m['reasoning']:<10} {m['desc']:<24} {cached:<8}{default}")
+
+    print("  " + "-" * 70)
+    print("    0 / q  = No LLM (regex mode)")
+    print()
+
+    while True:
         try:
-            req = urllib.request.Request(f"{self.host}/api/tags", method="GET")
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-                available_models = [m["name"] for m in data.get("models", [])]
-
-                if not available_models:
-                    return
-
-                # Use specified model or find first available
-                if self.model and self.model in available_models:
-                    self.available = True
-                elif self.model and any(self.model in m for m in available_models):
-                    # Partial match (e.g., "llama3.2" matches "llama3.2:3b")
-                    for m in available_models:
-                        if self.model in m:
-                            self.model = m
-                            self.available = True
-                            break
-                else:
-                    # Try default, then fallbacks
-                    for candidate in [self.DEFAULT_MODEL] + self.FALLBACK_MODELS:
-                        if candidate in available_models:
-                            self.model = candidate
-                            self.available = True
-                            break
-                        # Partial match
-                        for m in available_models:
-                            if candidate.split(":")[0] in m:
-                                self.model = m
-                                self.available = True
-                                break
-                        if self.available:
-                            break
-
-                    # Use first available if nothing matched
-                    if not self.available and available_models:
-                        self.model = available_models[0]
-                        self.available = True
-
-        except (urllib.error.URLError, TimeoutError, ConnectionRefusedError):
-            pass
-        except Exception:
-            pass
-
-    def generate(self, prompt: str, system: str = "", timeout: int = 90) -> str | None:
-        """Generate response from Ollama."""
-        if not self.available:
+            choice = input("  Select mode [1]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
             return None
 
-        import urllib.request
-        import urllib.error
-
-        try:
-            payload = {
-                "model": self.model,
-                "prompt": prompt,
-                "system": system,
-                "stream": False,
-                "options": {
-                    "temperature": 0.1,
-                    "num_predict": 512,
-                }
-            }
-
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                f"{self.host}/api/generate",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                result = json.loads(resp.read().decode())
-                return result.get("response", "").strip()
-
-        except Exception as e:
-            print(f"  [Ollama Error: {e}]")
+        if choice == "":
+            sel = AVAILABLE_MODELS[0]  # default: GPT-OSS-20B low
+            print(f"  -> {sel['name']} ({sel['reasoning']})")
+            return sel["hf_id"], sel["reasoning"]
+        if choice in ("0", "q", "Q"):
             return None
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(AVAILABLE_MODELS):
+                sel = AVAILABLE_MODELS[idx - 1]
+                print(f"  -> {sel['name']}")
+                return sel["hf_id"], sel["reasoning"]
+            else:
+                print(f"  Invalid choice. Enter 1-{len(AVAILABLE_MODELS)}, 0, or q.")
+        except ValueError:
+            print(f"  Invalid input. Enter a number 1-{len(AVAILABLE_MODELS)}, 0, or q.")
 
 
-class GroqClient:
-    """Client for Groq LLM inference API."""
+class LocalLLMClient:
+    """Client for GPT-OSS on GPU with Harmony format parsing via openai_harmony."""
 
     DEFAULT_MODEL = "openai/gpt-oss-120b"
 
-    def __init__(self, model: str | None = None, api_key: str | None = None):
-        self.model = model or self.DEFAULT_MODEL
-        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
-        self.available = bool(self.api_key)
-        self._client = None
+    MODEL_ALIASES = {
+        "gpt-oss": "openai/gpt-oss-120b",
+        "gpt-oss-120b": "openai/gpt-oss-120b",
+        "gpt-oss-20b": "openai/gpt-oss-20b",
+    }
 
-    def _get_client(self):
-        """Lazy load the Groq client."""
-        if self._client is None:
-            try:
-                from groq import Groq
-                self._client = Groq(api_key=self.api_key)
-            except Exception as e:
-                print(f"  [Groq init error: {e}]")
-                self.available = False
-        return self._client
+    REASONING_LEVELS = ("low", "medium", "high")
 
-    def generate(self, prompt: str, system: str = "", timeout: int = 90) -> str | None:
-        """Generate response from Groq API."""
+    def __init__(self, model: str | None = None, reasoning: str = "medium"):
+        resolved = self.MODEL_ALIASES.get(model, model) if model else None
+        self.model = resolved or self.DEFAULT_MODEL
+        self.reasoning = reasoning if reasoning in self.REASONING_LEVELS else "medium"
+        self.available = False
+        self.error_message: str | None = None
+        self._tokenizer = None
+        self._model = None
+        self._harmony_enc = None
+        self._load_model()
+
+    def _load_model(self):
+        """Load model, tokenizer, and Harmony encoding."""
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            print(f"Loading {self.model}...", end=" ", flush=True)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self.model, trust_remote_code=True
+            )
+            self._model = AutoModelForCausalLM.from_pretrained(
+                self.model,
+                dtype=torch.bfloat16,
+                device_map="auto",
+            )
+            self._model.eval()
+
+            from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+            self._harmony_enc = load_harmony_encoding(
+                HarmonyEncodingName.HARMONY_GPT_OSS
+            )
+
+            self.available = True
+            print("OK")
+
+        except Exception as e:
+            self.error_message = str(e)
+            print(f"FAILED ({e})")
+
+    def check_connection(self) -> tuple[bool, str]:
+        """Check if the model is loaded."""
+        if self.available:
+            return True, f"Local model loaded ({self.model})"
+        return False, f"Model not loaded: {self.error_message or 'Unknown error'}"
+
+    def _parse_harmony_output(self, new_token_ids) -> str:
+        """Parse generated tokens via openai_harmony. Returns the final channel text."""
+        from openai_harmony import Role
+        token_list = new_token_ids.tolist()
+        msgs = self._harmony_enc.parse_messages_from_completion_tokens(
+            token_list, role=Role.ASSISTANT, strict=False
+        )
+        for m in reversed(msgs):
+            if m.channel == "final":
+                return "".join(c.text for c in m.content if hasattr(c, "text")).strip()
+        if msgs:
+            return "".join(c.text for c in msgs[-1].content if hasattr(c, "text")).strip()
+        return ""
+
+    # Sentinels injected into the text queue for channel transitions
+    _THINK_START = "\x00T\x00"
+    _FINAL_START = "\x00F\x00"
+
+    @property
+    def display_name(self) -> str:
+        """Short display name for the model, e.g. 'GPT-OSS-120B'."""
+        return self.model.split("/")[-1].upper()
+
+    def _patch_streamer(self, streamer):
+        """Monkey-patch streamer.put() to decode via StreamableParser.
+
+        Completely bypasses TextIteratorStreamer's own decode logic.
+        Uses openai_harmony StreamableParser for all token decoding.
+        Only content from analysis and final channels is emitted.
+        """
+        from openai_harmony import Role, StreamableParser
+
+        _parser = StreamableParser(
+            self._harmony_enc, role=Role.ASSISTANT, strict=False
+        )
+        _seen_analysis = [False]
+        _seen_final = [False]
+        _skip_prompt = [True]
+        _THINK_START = self._THINK_START
+        _FINAL_START = self._FINAL_START
+
+        def _put_with_harmony(value):
+            if _skip_prompt[0]:
+                _skip_prompt[0] = False
+                return
+            ids = value.flatten().tolist() if hasattr(value, "flatten") else [value]
+            for tid in ids:
+                _parser.process(tid)
+                delta = _parser.last_content_delta
+                ch = _parser.current_channel
+
+                if ch == "analysis" and not _seen_analysis[0]:
+                    streamer.text_queue.put(_THINK_START)
+                    _seen_analysis[0] = True
+
+                if ch == "final" and not _seen_final[0]:
+                    streamer.text_queue.put(_FINAL_START)
+                    _seen_final[0] = True
+
+                if delta and ch in ("analysis", "final"):
+                    streamer.text_queue.put(delta)
+
+        streamer.put = _put_with_harmony
+
+    def _build_messages(
+        self,
+        prompt: str,
+        system: str = "",
+        history: list[tuple[str, str]] | None = None,
+    ) -> list[dict]:
+        """Build HF chat messages list with reasoning effort in system message."""
+        messages = []
+        sys_content = (
+            f"Reasoning: {self.reasoning}\n\n"
+            "# Valid channels: analysis, commentary, final. "
+            "Channel must be included for every message."
+        )
+        if system:
+            sys_content += f"\n\n{system}"
+        messages.append({"role": "system", "content": sys_content})
+        if history:
+            for user_msg, bot_msg in history:
+                if user_msg:
+                    messages.append({"role": "user", "content": user_msg})
+                if bot_msg:
+                    messages.append({"role": "assistant", "content": bot_msg})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def _tokenize(self, messages: list[dict]):
+        """Apply chat template and tokenize. Returns (input_ids, attention_mask)."""
+        input_text = self._tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self._tokenizer(input_text, return_tensors="pt").to(self._model.device)
+        return inputs["input_ids"], inputs["attention_mask"]
+
+    def generate(
+        self,
+        prompt: str,
+        system: str = "",
+        timeout: int = 90,
+        stream: bool = False,
+        history: list[tuple[str, str]] | None = None,
+        agent: str = "",
+        final_color: str = "",
+    ) -> str | None:
+        """Generate a response.
+
+        stream=False: silent internal call, returns parsed final-channel text.
+        stream=True:  prints streaming output to terminal.
+        history: list of (user_msg, assistant_msg) tuples for conversation context.
+        agent: display name for this agent (e.g. "Intent Agent").
+        final_color: ANSI color code for the final output (e.g. "\\033[32m" for green).
+                     Empty string keeps it gray.
+        """
         if not self.available:
             return None
 
-        client = self._get_client()
-        if not client:
-            return None
+        import torch
+        from transformers import TextIteratorStreamer
+        import threading
 
         try:
-            messages = []
-            if system:
-                messages.append({"role": "system", "content": system})
-            messages.append({"role": "user", "content": prompt})
+            messages = self._build_messages(prompt, system, history)
+            input_ids, attention_mask = self._tokenize(messages)
+            prompt_len = input_ids.shape[1]
 
-            completion = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
+            if not stream:
+                with torch.no_grad():
+                    outputs = self._model.generate(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=512,
+                        temperature=0.1,
+                        top_p=0.9,
+                        do_sample=True,
+                        pad_token_id=self._tokenizer.eos_token_id,
+                    )
+                return self._parse_harmony_output(outputs[0][prompt_len:])
+
+            # ── Streaming path ──
+            streamer = TextIteratorStreamer(
+                self._tokenizer, skip_prompt=True, skip_special_tokens=True
+            )
+            self._patch_streamer(streamer)
+
+            gen_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=512,
                 temperature=0.1,
-                max_completion_tokens=512,
-                top_p=1,
-                stream=False,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=self._tokenizer.eos_token_id,
+                streamer=streamer,
             )
 
-            return completion.choices[0].message.content.strip()
+            thread = threading.Thread(target=lambda: self._model.generate(**gen_kwargs))
+            thread.start()
+
+            answer_text = ""
+            in_final = False
+            in_thinking = False
+            tag = f"[{agent}]" if agent else ""
+
+            # Thinking line in dark gray
+            print(f"\033[90m{tag} [thinking] ", end="", flush=True)
+
+            for new_text in streamer:
+                if new_text == self._THINK_START:
+                    in_thinking = True
+                    continue
+                if new_text == self._FINAL_START:
+                    if in_thinking:
+                        print(" [/thinking]", end="", flush=True)
+                    # Final output on next line, in chosen color or gray
+                    color = final_color if final_color else "\033[90m"
+                    print(f"\033[0m", flush=True)
+                    print(f"{color}", end="", flush=True)
+                    in_final = True
+                    in_thinking = False
+                    continue
+                print(new_text, end="", flush=True)
+                if in_final:
+                    answer_text += new_text
+
+            thread.join()
+            print("\033[0m", flush=True)  # reset, single newline
+
+            return answer_text.strip() or None
 
         except Exception as e:
-            print(f"  [Groq Error: {e}]")
+            print(f"  [LLM Error: {e}]")
             return None
+
+    def chat(
+        self,
+        message: str,
+        history: list[tuple[str, str]],
+        system: str = "",
+    ) -> Generator[str, None, None]:
+        """Streaming chat for Gradio UI. Yields only the final-channel answer."""
+        if not self.available:
+            yield f"Model not available: {self.error_message}"
+            return
+
+        from transformers import TextIteratorStreamer
+        import threading
+
+        try:
+            messages = self._build_messages(message, system, history)
+            input_ids, attention_mask = self._tokenize(messages)
+
+            streamer = TextIteratorStreamer(
+                self._tokenizer, skip_prompt=True, skip_special_tokens=True
+            )
+            self._patch_streamer(streamer)
+
+            gen_kwargs = dict(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=1024,
+                temperature=0.7,
+                top_p=0.9,
+                do_sample=True,
+                pad_token_id=self._tokenizer.eos_token_id,
+                streamer=streamer,
+            )
+
+            thread = threading.Thread(target=lambda: self._model.generate(**gen_kwargs))
+            thread.start()
+
+            answer_text = ""
+            in_final = False
+
+            for new_text in streamer:
+                if new_text == self._THINK_START:
+                    continue
+                if new_text == self._FINAL_START:
+                    in_final = True
+                    continue
+                if in_final:
+                    answer_text += new_text
+                    yield answer_text
+
+            thread.join()
+
+        except Exception as e:
+            yield f"Error: {str(e)}"
+
+
+SYSTEM_PROMPT_PATH = EASY_DIR / "system_prompt.txt"
 
 
 class LLMHelper:
     """Use LLM for natural language understanding and responses."""
-
-    SYSTEM_PROMPT = """You are a helpful assistant for Surya, a solar forecasting system.
-
-Surya is a 366M parameter foundation model trained on SDO (Solar Dynamics Observatory) data.
-
-## WHAT SURYA CAN DO
-
-### Inference & Prediction
-- Run solar predictions for any date from 2010-present
-- Multi-step rollout: predict 1-24 hours ahead (each step = 1 hour)
-- Outputs predictions for all 13 channels simultaneously
-- Auto-downloads required SDO data from AWS S3
-- Saves results to prediction.nc (NetCDF format)
-
-### Analysis & Metrics
-- MSE (Mean Squared Error): per-step and average
-- RMSE, MAE, bias: available in analysis
-- Channel ranking: rank channels by prediction accuracy
-- MSE trend plots: visualize error over prediction steps
-- Comparison plots: Ground Truth vs Prediction vs Difference
-
-### Available Channels (13 total)
-AIA EUV (8): aia94 (flares), aia131, aia171 (corona), aia193, aia211, aia304 (chromosphere), aia335, aia1600
-HMI Magnetic (5): hmi_m (magnitude), hmi_bx, hmi_by, hmi_bz (vertical), hmi_v (velocity)
-
-### Channel Recommendations
-- Solar flares: aia94 or aia131 (hot plasma ~6-10 MK)
-- Corona structure: aia171 or aia193
-- Magnetic field: hmi_bz (vertical) or hmi_m (total)
-- Chromosphere: aia304
-
-## WHAT SURYA CANNOT DO
-- Real-time predictions (requires pre-downloaded data)
-- Train or fine-tune the model
-- Process non-SDO data sources
-- Sub-hourly predictions (minimum 1-hour steps)
-
-## METRICS EXPLAINED
-- MSE: Mean Squared Error - average of (prediction - ground_truth)^2
-- RMSE: Root MSE - square root of MSE, same units as data
-- MAE: Mean Absolute Error - average of |prediction - ground_truth|
-
-Keep responses concise (1-3 sentences). When users ask what you can do, explain the capabilities above."""
 
     INTENT_DETECTION_PROMPT = """You are a command router for Surya, a solar forecasting system.
 
@@ -293,8 +465,9 @@ Classify the user's intent into ONE of these actions:
 - INFERENCE: User wants to run the model, get predictions, generate output for a date
 - ANALYSIS: User wants to analyze existing predictions, compare channels, see MSE/errors
 - QUESTION: User is asking a question about the system, channels, or solar physics
+- CHAT: Greetings, small talk, casual conversation, thanks, or anything not related to solar forecasting
 
-Output ONLY one word: INFERENCE, ANALYSIS, or QUESTION
+Output ONLY one word: INFERENCE, ANALYSIS, QUESTION, or CHAT
 
 Examples:
 "get model output for october 23 2014" -> INFERENCE
@@ -308,6 +481,10 @@ Examples:
 "what channel shows flares?" -> QUESTION
 "how does the model work?" -> QUESTION
 "tell me about aia94" -> QUESTION
+"hi" -> CHAT
+"hello" -> CHAT
+"thanks" -> CHAT
+"how are you" -> CHAT
 
 User query:"""
 
@@ -374,30 +551,47 @@ Parameters extracted:
 Generate a 1-2 sentence response explaining what will happen. Be specific about the date and prediction horizon.
 Include something interesting about solar forecasting if relevant."""
 
-    def __init__(self, llm: GroqClient):
+    def __init__(self, llm: LocalLLMClient):
         self.llm = llm
+        self._system_prompt = self._load_system_prompt()
 
-    def ask(self, user_input: str) -> str | None:
+    @staticmethod
+    def _load_system_prompt() -> str:
+        """Load system prompt from external file."""
+        if SYSTEM_PROMPT_PATH.exists():
+            return SYSTEM_PROMPT_PATH.read_text().strip()
+        return "You are a helpful assistant for Surya, a solar forecasting system."
+
+    def ask(
+        self,
+        user_input: str,
+        stream: bool = False,
+        history: list[tuple[str, str]] | None = None,
+    ) -> str | None:
         """Get a natural language response from the LLM."""
         if not self.llm.available:
             return None
-        return self.llm.generate(user_input, self.SYSTEM_PROMPT)
+        return self.llm.generate(
+            user_input, self._system_prompt, stream=stream, history=history,
+            agent="Response Agent", final_color="\033[32m",
+        )
+
+    _VALID_INTENTS = {"INFERENCE", "ANALYSIS", "QUESTION", "CHAT"}
 
     def detect_intent(self, user_input: str) -> str:
-        """Detect user intent: INFERENCE, ANALYSIS, or QUESTION."""
+        """Detect user intent using LLM with visible streaming output."""
         if not self.llm.available:
-            return "QUESTION"  # Default fallback
+            return "QUESTION"
 
         prompt = f"{self.INTENT_DETECTION_PROMPT} \"{user_input}\""
-        response = self.llm.generate(prompt, "", timeout=15)
+        response = self.llm.generate(prompt, "", timeout=15, stream=True, agent="Intent Agent", final_color="\033[37m")
 
-        if response:
-            response = response.strip().upper()
-            if "INFERENCE" in response:
-                return "INFERENCE"
-            elif "ANALYSIS" in response:
-                return "ANALYSIS"
-        return "QUESTION"
+        if not response:
+            return "QUESTION"
+
+        last_line = response.strip().split("\n")[-1].strip()
+        token = last_line.split()[0].upper().strip(".:,\"'()") if last_line.split() else ""
+        return token if token in self._VALID_INTENTS else "QUESTION"
 
     def extract_params(self, user_input: str, max_retries: int = 2) -> dict[str, Any] | None:
         """Extract structured parameters from natural language using LLM.
@@ -414,7 +608,7 @@ Include something interesting about solar forecasting if relevant."""
             if attempt > 0:
                 prompt += "\n\nIMPORTANT: Output ONLY valid JSON."
 
-            response = self.llm.generate(prompt, "", timeout=45)
+            response = self.llm.generate(prompt, "", timeout=45, stream=True, agent="Params Agent")
 
             if not response:
                 continue
@@ -447,7 +641,7 @@ Include something interesting about solar forecasting if relevant."""
             understood=understood,
             missing=", ".join(missing)
         )
-        return self.llm.generate(prompt, "", timeout=30)
+        return self.llm.generate(prompt, "", timeout=30, stream=True, agent="Follow-up Agent")
 
     def generate_response(self, date: str, rollout: int) -> str | None:
         """Generate a friendly response explaining what will happen."""
@@ -458,7 +652,7 @@ Include something interesting about solar forecasting if relevant."""
             date=date,
             rollout=rollout
         )
-        return self.llm.generate(prompt, "", timeout=30)
+        return self.llm.generate(prompt, "", timeout=30, agent="Response Agent")
 
     def is_query_complete(self, params: dict[str, Any]) -> bool:
         """Check if extracted params have all required info."""
@@ -496,56 +690,27 @@ class DateParser:
 class SuryaInterface:
     """Main interface class with LLM support."""
 
-    def __init__(self, use_llm: bool = True, llm_backend: str = "auto", llm_model: str | None = None):
+    def __init__(self, use_llm: bool = True, llm_model: str | None = None, reasoning: str = "medium"):
         self.logger = SessionLogger()
         self.date_parser = DateParser()
         self.last_output_dir: str | None = None
+        self._reasoning = reasoning
 
         # Initialize LLM
-        self.llm: GroqClient | OllamaClient | None = None
+        self.llm: LocalLLMClient | None = None
         self.llm_helper: LLMHelper | None = None
         self.pending_inference: dict | None = None  # For multi-turn conversations
-        self.llm_backend = llm_backend
+        self.conversation_history: list[tuple[str, str]] = []  # (user, assistant)
 
         if use_llm:
-            self._init_llm(llm_backend, llm_model)
+            self._init_llm(llm_model)
 
-    def _init_llm(self, backend: str, model: str | None):
-        """Initialize LLM based on backend preference."""
-        if backend == "ollama":
-            self._init_ollama(model)
-        elif backend == "groq":
-            self._init_groq(model)
-        else:  # auto - try Ollama first, then Groq
-            print("Checking for local Ollama...", end=" ", flush=True)
-            self.llm = OllamaClient(model=model)
-            if self.llm.available:
-                self.llm_helper = LLMHelper(self.llm)
-                print(f"OK (using {self.llm.model})")
-            else:
-                print("not found")
-                self._init_groq(model)
-
-    def _init_ollama(self, model: str | None):
-        """Initialize Ollama client."""
-        print("Initializing Ollama...", end=" ", flush=True)
-        self.llm = OllamaClient(model=model)
+    def _init_llm(self, model: str | None):
+        """Initialize local HuggingFace model."""
+        self.llm = LocalLLMClient(model=model, reasoning=self._reasoning)
         if self.llm.available:
             self.llm_helper = LLMHelper(self.llm)
-            print(f"OK (using {self.llm.model})")
         else:
-            print("Not available (is Ollama running?)")
-            self.llm = None
-
-    def _init_groq(self, model: str | None):
-        """Initialize Groq client."""
-        print("Initializing Groq API...", end=" ", flush=True)
-        self.llm = GroqClient(model=model)
-        if self.llm.available:
-            self.llm_helper = LLMHelper(self.llm)
-            print(f"OK (using {self.llm.model})")
-        else:
-            print("Not available (check GROQ_API_KEY)")
             self.llm = None
 
     def run(self):
@@ -554,9 +719,11 @@ class SuryaInterface:
 
         while True:
             try:
-                cmd = input("\n[surya] > ").strip()
+                print()
+                cmd = input("[[SuryaGPT]] > ").strip()
                 if not cmd:
                     continue
+                print()  # blank line after input
                 if cmd.lower() in ["exit", "quit", "q"]:
                     print("\nGoodbye!")
                     self.logger.log("session_end")
@@ -634,10 +801,15 @@ class SuryaInterface:
                 self.run_inference(cmd)
             elif intent == "ANALYSIS":
                 self.run_analysis(cmd)
-            else:  # QUESTION
-                response = self.llm_helper.ask(cmd)
+            elif intent in ("CHAT", "QUESTION"):
+                response = self.llm_helper.ask(
+                    cmd, stream=True, history=self.conversation_history
+                )
                 if response:
-                    print(f"\n  {response}")
+                    self.conversation_history.append((cmd, response))
+                    # Keep history bounded to avoid blowing up context
+                    if len(self.conversation_history) > 20:
+                        self.conversation_history = self.conversation_history[-20:]
                     self.logger.log("llm_response", {"input": cmd, "response": response})
         else:
             # Fallback to keyword matching if LLM unavailable
@@ -705,17 +877,16 @@ class SuryaInterface:
             return
 
         # Use LLM to extract and validate parameters
-        print("\n  Analyzing your request...")
         params = self.llm_helper.extract_params(cmd)
 
         if not params:
-            print("\n  I couldn't understand that request. Could you try rephrasing?")
-            print("  Example: 'run prediction for october 23 2014 with 3 rollout steps'")
+            print("  Extraction failed, trying regex fallback...")
+            self._run_inference_basic(cmd, dry_run, skip_download)
             return
 
         # Show what LLM understood
         understood = params.get("understood", "Processing your request")
-        print(f"\n  {understood}")
+        print(f"  > {understood}")
 
         # Check if we have all required info
         missing = params.get("missing", [])
@@ -751,12 +922,7 @@ class SuryaInterface:
         # Set default rollout if not specified
         if rollout is None:
             rollout = 1
-            print(f"\n  Using default: {rollout} rollout step")
-
-        # Generate friendly response
-        response = self.llm_helper.generate_response(start_dt, rollout)
-        if response:
-            print(f"\n  {response}")
+            print(f"  Using default: {rollout} rollout step")
 
         # Execute inference
         self._execute_inference(start_dt, rollout, dry_run, skip_download)
@@ -777,15 +943,10 @@ class SuryaInterface:
 
         if params and params.get("start_datetime"):
             understood = params.get("understood", "Got it!")
-            print(f"\n  {understood}")
+            print(f"\n  > {understood}")
 
             start_dt = params.get("start_datetime")
             rollout = params.get("rollout_steps") or 1
-
-            # Generate response
-            response = self.llm_helper.generate_response(start_dt, rollout)
-            if response:
-                print(f"\n  {response}")
 
             # Execute
             self._execute_inference(
@@ -816,25 +977,48 @@ class SuryaInterface:
         if skip_download:
             args.append("--skip-download")
 
-        print(f"\n  Parameters:")
-        print(f"    Start: {start_dt}")
-        print(f"    Rollout steps: {rollout}")
-        print(f"    End: (auto-calculated)")
+        # Compute input/output timeline (cadence = 60 min)
+        try:
+            dt = datetime.strptime(start_dt, "%Y-%m-%d %H:%M")
+        except ValueError:
+            dt = datetime.strptime(start_dt, "%Y-%m-%d %H:%M:%S")
+        from datetime import timedelta
 
-        print("\n>>> Running Surya model...")
+        prediction_steps = rollout + 1
+        fmt = "%b %d %H:%M"
+        date_str = dt.strftime("%B %d, %Y")
+
+        # Build labels: first 2 inputs are always GT, then slides
+        input_t0 = dt - timedelta(minutes=60)
+        input_t1 = dt
+        window = [f"GT {input_t0.strftime(fmt)}", f"GT {input_t1.strftime(fmt)}"]
+
+        print(f"\n  Surya Inference Plan  ({date_str}, {prediction_steps} steps)")
+        print(f"  " + "-" * 60)
+        for step in range(1, prediction_steps + 1):
+            out_t = dt + timedelta(minutes=60 * step)
+            out_label = f"Pred {out_t.strftime(fmt)}"
+            print(f"    Step {step}/{prediction_steps}  [{window[0]}, {window[1]}] -> {out_label}")
+            window = [window[1], out_label]
+        print(f"  " + "-" * 60)
+        print()
 
         self.logger.log("inference_start", {
             "start_datetime": start_dt,
             "rollout_steps": rollout,
         })
 
-        result = subprocess.run(args, cwd=ROOT_DIR)
-        self.logger.log("inference_end", {"returncode": result.returncode})
+        try:
+            result = subprocess.run(args, cwd=ROOT_DIR)
+            self.logger.log("inference_end", {"returncode": result.returncode})
 
-        if result.returncode == 0:
-            print("\n>>> Prediction complete!")
-        else:
-            print(f"\n>>> Inference failed with code {result.returncode}")
+            if result.returncode == 0:
+                print("\n>>> Prediction complete!")
+            else:
+                print(f"\n>>> Inference failed with code {result.returncode}")
+        except Exception as e:
+            print(f"\n>>> Inference error: {e}")
+            self.logger.log("inference_error", {"error": str(e)})
 
     def _run_inference_basic(self, cmd: str, dry_run: bool, skip_download: bool):
         """Basic inference without LLM (fallback mode)."""
@@ -964,8 +1148,7 @@ class SuryaInterface:
     def show_welcome(self):
         """Show welcome message."""
         if self.llm and self.llm.available:
-            backend_name = "Ollama" if isinstance(self.llm, OllamaClient) else "Groq"
-            llm_status = f"LLM: {backend_name} ({self.llm.model})"
+            llm_status = f"LLM: {self.llm.model}"
         else:
             llm_status = "LLM: OFF (regex mode)"
 
@@ -1123,36 +1306,41 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python llm_interface.py                    # Auto-detect (Ollama first, then Groq)
-  python llm_interface.py --ollama           # Use local Ollama
-  python llm_interface.py --groq             # Use Groq API
-  python llm_interface.py --ollama --model llama3.2:3b
-  python llm_interface.py --no-llm           # Disable LLM (regex only)
+  python llm_interface.py                       # Interactive mode selection
+  python llm_interface.py --model gpt-oss --reasoning high
+  python llm_interface.py --no-llm              # Disable LLM (regex only)
         """
     )
 
     parser.add_argument("--no-llm", action="store_true", help="Disable LLM (regex-only mode)")
-    parser.add_argument("--ollama", action="store_true", help="Use local Ollama LLM")
-    parser.add_argument("--groq", action="store_true", help="Use Groq API")
-    parser.add_argument("--model", type=str, default=None, help="Specify LLM model name")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Model name: gpt-oss, gpt-oss-120b, gpt-oss-20b")
+    parser.add_argument("--reasoning", type=str, default=None,
+                        choices=["low", "medium", "high"],
+                        help="Reasoning level (skips interactive menu)")
 
     args = parser.parse_args()
 
-    # Determine backend
     if args.no_llm:
         use_llm = False
-        backend = "none"
-    elif args.ollama:
+        model = None
+        reasoning = "medium"
+    elif args.model:
+        model = LocalLLMClient.MODEL_ALIASES.get(args.model, args.model)
+        reasoning = args.reasoning or "medium"
         use_llm = True
-        backend = "ollama"
-    elif args.groq:
-        use_llm = True
-        backend = "groq"
     else:
-        use_llm = True
-        backend = "auto"
+        # Interactive selection menu
+        result = select_model()
+        if result is None:
+            use_llm = False
+            model = None
+            reasoning = "medium"
+        else:
+            model, reasoning = result
+            use_llm = True
 
-    interface = SuryaInterface(use_llm=use_llm, llm_backend=backend, llm_model=args.model)
+    interface = SuryaInterface(use_llm=use_llm, llm_model=model, reasoning=reasoning)
     interface.run()
 
 
