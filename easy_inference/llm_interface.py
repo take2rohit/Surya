@@ -453,114 +453,29 @@ class LocalLLMClient:
             yield f"Error: {str(e)}"
 
 
-SYSTEM_PROMPT_PATH = EASY_DIR / "system_prompt.txt"
+PROMPTS_DIR = EASY_DIR / "prompts"
+SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.txt"
+
+
+def _load_prompt(name: str) -> str:
+    """Load a prompt from the prompts/ directory by filename."""
+    path = PROMPTS_DIR / name
+    if path.exists():
+        return path.read_text().strip()
+    raise FileNotFoundError(f"Prompt file not found: {path}")
 
 
 class LLMHelper:
     """Use LLM for natural language understanding and responses."""
 
-    INTENT_DETECTION_PROMPT = """You are a command router for Surya, a solar forecasting system.
-
-Classify the user's intent into ONE of these actions:
-- INFERENCE: User wants to run the model, get predictions, generate output for a date
-- ANALYSIS: User wants to analyze existing predictions, compare channels, see MSE/errors
-- QUESTION: User is asking a question about the system, channels, or solar physics
-- CHAT: Greetings, small talk, casual conversation, thanks, or anything not related to solar forecasting
-
-Output ONLY one word: INFERENCE, ANALYSIS, QUESTION, or CHAT
-
-Examples:
-"get model output for october 23 2014" -> INFERENCE
-"run prediction for the solar flare day" -> INFERENCE
-"predict 5 hours ahead for march 2020" -> INFERENCE
-"show me what happens on twelve october" -> INFERENCE
-"analyze the results" -> ANALYSIS
-"compare all channels" -> ANALYSIS
-"which channel has lowest error" -> ANALYSIS
-"rank channels by MSE" -> ANALYSIS
-"what channel shows flares?" -> QUESTION
-"how does the model work?" -> QUESTION
-"tell me about aia94" -> QUESTION
-"hi" -> CHAT
-"hello" -> CHAT
-"thanks" -> CHAT
-"how are you" -> CHAT
-
-User query:"""
-
-    PARAM_EXTRACTION_PROMPT = """You are a parameter extraction assistant for Surya solar forecasting.
-
-TASK: Extract date, time, and rollout parameters. Output JSON with your analysis.
-
-REQUIRED INFO:
-- Date with YEAR (e.g., "october 23 2014", "2020-05-20") - YEAR IS REQUIRED
-- Rollout steps (optional, default: 1)
-
-DATE RULES:
-- "twelve" = 12, "twenty third" = 23
-- YEAR is required - if missing, set date to null
-- Default time: 10:00 (if hour not specified)
-
-ROLLOUT RULES:
-- "N steps", "N rollout steps", "N hours ahead"
-- Word numbers: "five" = 5
-
-OUTPUT FORMAT (JSON only):
-{
-  "start_datetime": "YYYY-MM-DD HH:MM" or null,
-  "rollout_steps": N or null,
-  "missing": ["list of missing required fields"],
-  "understood": "brief description of what you understood"
-}
-
-EXAMPLES:
-Query: "october 23 2014 with 5 steps"
-{"start_datetime": "2014-10-23 10:00", "rollout_steps": 5, "missing": [], "understood": "Run prediction for Oct 23, 2014 with 5 rollout steps"}
-
-Query: "may twenty with 1 step"
-{"start_datetime": null, "rollout_steps": 1, "missing": ["year"], "understood": "May 20th with 1 rollout step, but year is missing"}
-
-Query: "run prediction"
-{"start_datetime": null, "rollout_steps": null, "missing": ["date", "year"], "understood": "Want to run prediction but no date specified"}
-
-Query: "2020-05-20"
-{"start_datetime": "2020-05-20 10:00", "rollout_steps": null, "missing": [], "understood": "May 20, 2020, will use default rollout steps"}
-
-Now parse this query:"""
-
-    FOLLOWUP_PROMPT = """You are a helpful assistant for Surya solar forecasting.
-The user wants to run a prediction but some information is missing.
-
-Based on what they said and what's missing, ask a friendly follow-up question to get the missing info.
-Keep it conversational and brief (1-2 sentences).
-
-User said: "{query}"
-Understood: {understood}
-Missing: {missing}
-
-Generate a friendly follow-up question:"""
-
-    RESPONSE_PROMPT = """You are a helpful assistant for Surya solar forecasting.
-Generate a brief, friendly response explaining what you're about to do.
-
-Parameters extracted:
-- Date: {date}
-- Rollout steps: {rollout}
-- Action: Running solar prediction model
-
-Generate a 1-2 sentence response explaining what will happen. Be specific about the date and prediction horizon.
-Include something interesting about solar forecasting if relevant."""
-
     def __init__(self, llm: LocalLLMClient):
         self.llm = llm
-        self._system_prompt = self._load_system_prompt()
-
-    @staticmethod
-    def _load_system_prompt() -> str:
-        """Load system prompt from external file."""
-        if SYSTEM_PROMPT_PATH.exists():
-            return SYSTEM_PROMPT_PATH.read_text().strip()
-        return "You are a helpful assistant for Surya, a solar forecasting system."
+        # Load all prompts from prompts/ directory
+        self._system_prompt = _load_prompt("system_prompt.txt")
+        self._intent_prompt = _load_prompt("intent_agent.txt")
+        self._params_prompt = _load_prompt("params_agent.txt")
+        self._followup_prompt = _load_prompt("followup_agent.txt")
+        self._response_prompt = _load_prompt("response_agent.txt")
 
     def ask(
         self,
@@ -583,7 +498,7 @@ Include something interesting about solar forecasting if relevant."""
         if not self.llm.available:
             return "QUESTION"
 
-        prompt = f"{self.INTENT_DETECTION_PROMPT} \"{user_input}\""
+        prompt = f"{self._intent_prompt} \"{user_input}\""
         response = self.llm.generate(prompt, "", timeout=15, stream=True, agent="Intent Agent", final_color="\033[37m")
 
         if not response:
@@ -603,12 +518,12 @@ Include something interesting about solar forecasting if relevant."""
             return None
 
         for attempt in range(max_retries):
-            prompt = f"{self.PARAM_EXTRACTION_PROMPT}\nQuery: \"{user_input}\""
+            prompt = f"{self._params_prompt}\nQuery: \"{user_input}\""
 
             if attempt > 0:
                 prompt += "\n\nIMPORTANT: Output ONLY valid JSON."
 
-            response = self.llm.generate(prompt, "", timeout=45, stream=True, agent="Params Agent")
+            response = self.llm.generate(prompt, "", timeout=45, stream=True, agent="Params Agent", final_color="\033[37m")
 
             if not response:
                 continue
@@ -636,23 +551,23 @@ Include something interesting about solar forecasting if relevant."""
         if not self.llm.available:
             return None
 
-        prompt = self.FOLLOWUP_PROMPT.format(
+        prompt = self._followup_prompt.format(
             query=query,
             understood=understood,
             missing=", ".join(missing)
         )
-        return self.llm.generate(prompt, "", timeout=30, stream=True, agent="Follow-up Agent")
+        return self.llm.generate(prompt, "", timeout=30, stream=True, agent="Follow-up Agent", final_color="\033[32m")
 
     def generate_response(self, date: str, rollout: int) -> str | None:
         """Generate a friendly response explaining what will happen."""
         if not self.llm.available:
             return None
 
-        prompt = self.RESPONSE_PROMPT.format(
+        prompt = self._response_prompt.format(
             date=date,
             rollout=rollout
         )
-        return self.llm.generate(prompt, "", timeout=30, agent="Response Agent")
+        return self.llm.generate(prompt, "", timeout=30, agent="Response Agent", final_color="\033[32m")
 
     def is_query_complete(self, params: dict[str, Any]) -> bool:
         """Check if extracted params have all required info."""
@@ -886,7 +801,6 @@ class SuryaInterface:
 
         # Show what LLM understood
         understood = params.get("understood", "Processing your request")
-        print(f"  > {understood}")
 
         # Check if we have all required info
         missing = params.get("missing", [])
@@ -895,17 +809,15 @@ class SuryaInterface:
 
         if missing or not start_dt:
             # Ask follow-up question
-            print()
+            if not missing:
+                missing = ["date", "year", "time"]
             followup = self.llm_helper.generate_followup(
                 cmd,
                 understood,
-                missing if missing else ["complete date with year"]
+                missing,
             )
-            if followup:
-                print(f"  {followup}")
-            else:
-                print("  I need a complete date with year (e.g., 'october 23 2014').")
-                print("  Please provide the missing information.")
+            if not followup:
+                print(f"  Missing: {', '.join(missing)}. Please provide date, year, and start time (e.g., 'october 23 2014 at 10am').")
 
             # Store pending context for next command
             self.pending_inference = {
@@ -919,10 +831,10 @@ class SuryaInterface:
         # Clear any pending context
         self.pending_inference = None
 
-        # Set default rollout if not specified
+        # Set default rollout if not specified (0 = single 1-hour-ahead prediction)
         if rollout is None:
-            rollout = 1
-            print(f"  Using default: {rollout} rollout step")
+            rollout = 0
+            print(f"  Using default: no rollout (single 1-hour-ahead prediction)")
 
         # Execute inference
         self._execute_inference(start_dt, rollout, dry_run, skip_download)
@@ -946,7 +858,7 @@ class SuryaInterface:
             print(f"\n  > {understood}")
 
             start_dt = params.get("start_datetime")
-            rollout = params.get("rollout_steps") or 1
+            rollout = params.get("rollout_steps") or 0
 
             # Execute
             self._execute_inference(
@@ -1023,7 +935,7 @@ class SuryaInterface:
     def _run_inference_basic(self, cmd: str, dry_run: bool, skip_download: bool):
         """Basic inference without LLM (fallback mode)."""
         start_dt, _ = self.date_parser.parse(cmd)
-        rollout = self.date_parser.parse_rollout(cmd) or 1
+        rollout = self.date_parser.parse_rollout(cmd) or 0
 
         if not start_dt:
             print("  No date found. Please use format: 'YYYY-MM-DD' (e.g., 2014-10-23)")

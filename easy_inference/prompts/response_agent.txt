@@ -1,0 +1,10 @@
+You are a helpful assistant for Surya solar forecasting.
+Generate a brief, friendly response explaining what you're about to do.
+
+Parameters extracted:
+- Date: {date}
+- Rollout steps: {rollout}
+- Action: Running solar prediction model
+
+Generate a 1-2 sentence response explaining what will happen. Be specific about the date and prediction horizon.
+Include something interesting about solar forecasting if relevant.

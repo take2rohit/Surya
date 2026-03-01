@@ -1,20 +1,18 @@
 #!/usr/bin/env python3
 """
-Surya Chat UI - Beautiful Interface with Groq LLM & Image Support
+Surya Chat UI - Beautiful Interface with GPT-OSS & Image Support
 
 A modern web interface for solar forecasting with:
-- Chat interface with streaming responses via Groq
+- Chat interface with streaming responses via GPT-OSS (Harmony format)
 - Inline image display and upload
 - Integration with Surya model
 - Real-time connection status
 
 Usage:
-    source .venv/bin/activate
     python chat_ui.py
+    python chat_ui.py --model gpt-oss-20b
 """
 
-import base64
-import os
 import re
 import subprocess
 import sys
@@ -22,12 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator
 
-from dotenv import load_dotenv
 import gradio as gr
-
-# Load environment variables from .env file
-load_dotenv()
 from PIL import Image
+
+from llm_interface import AVAILABLE_MODELS, LocalLLMClient, select_model
 
 # Project paths
 ROOT_DIR = Path(__file__).resolve().parent
@@ -52,167 +48,40 @@ CHANNEL_INFO = {
 }
 
 
-class GroqClient:
-    """Client for Groq LLM inference API with streaming."""
-
-    DEFAULT_MODEL = "openai/gpt-oss-120b"
-
-    SYSTEM_PROMPT = """You are Surya Assistant, an AI helper for the Surya solar forecasting system.
+CHAT_SYSTEM_PROMPT = """You are Surya Assistant, an AI helper for the Surya solar forecasting system.
 
 Surya is a 366M parameter foundation model trained on SDO (Solar Dynamics Observatory) data.
 It predicts solar observations across multiple wavelengths and magnetic field measurements.
 
-## SURYA CAPABILITIES - WHAT IT CAN DO
+## SURYA CAPABILITIES
 
 ### Inference & Prediction
-- **Run solar predictions**: Generate forecasts for any date from 2010-present
-- **Multi-step rollout**: Predict 1-24 hours ahead (each step = 1 hour)
-- **13 channel output**: Predicts all AIA and HMI channels simultaneously
-- **Auto-download data**: Fetches required SDO data from AWS S3 automatically
-- **Save to NetCDF**: Outputs prediction.nc with predictions + ground truth
+- Run solar predictions for any date from 2010-present
+- Multi-step rollout: predict 1-24 hours ahead (each step = 1 hour)
+- 13 channel output: all AIA and HMI channels simultaneously
+- Auto-downloads SDO data from AWS S3, saves to NetCDF
 
 ### Analysis & Metrics
-- **MSE (Mean Squared Error)**: Compute per-step and average MSE
-- **RMSE, MAE, bias**: Available in analysis notebook
-- **Channel ranking**: Rank channels by prediction accuracy
-- **MSE trend plots**: Visualize error over prediction steps
-- **Comparison plots**: Side-by-side Ground Truth vs Prediction vs Difference
+- MSE, RMSE, MAE, bias per-step and average
+- Channel ranking by prediction accuracy
+- MSE trend plots and comparison plots (GT vs Prediction vs Difference)
 
-### Visualization
-- **Per-channel images**: Generate PNG comparisons for each channel
-- **MSE trend charts**: Plot error progression over time
-- **Gallery view**: Browse all generated images by channel
+### Available Channels (13 total)
+AIA EUV (8): aia94 (flares), aia131, aia171 (corona), aia193, aia211, aia304 (chromosphere), aia335, aia1600
+HMI Magnetic (5): hmi_m (magnitude), hmi_bx, hmi_by, hmi_bz (vertical), hmi_v (velocity)
 
-### Data Handling
-- **Date range selection**: Specify start datetime and rollout steps
-- **Automatic end time**: Calculates required data window
-- **Missing data handling**: Continues with available data, marks missing as NaN
-- **Ground truth comparison**: Loads GT for loss computation when available
-
-## WHAT SURYA CANNOT DO
-- Real-time predictions (requires pre-downloaded data)
-- Train or fine-tune the model
-- Process non-SDO data sources
-- Predict beyond available SDO data (2010-present)
-- Sub-hourly predictions (minimum 1-hour steps)
+### Channel Recommendations
+- Solar flares: aia94, aia131
+- Corona structure: aia171, aia193
+- Magnetic field: hmi_bz, hmi_m
 
 ## CHAT COMMANDS
+- `run prediction for 2014-10-23 12:00` - Run inference
+- `predict 2014-10-23 with 4 steps` - 4-hour forecast
+- `show images` - View latest predictions
+- `what is MSE?` - Ask questions
 
-| Command | Example | What it does |
-|---------|---------|--------------|
-| Run prediction | `run prediction for 2014-10-23 12:00` | Runs inference for that date |
-| With rollout | `predict 2014-10-23 with 4 steps` | 4-hour forecast (5 predictions) |
-| Show images | `show images` | Lists latest prediction images |
-| Ask questions | `what is MSE?` | Answers solar/Surya questions |
-
-## AVAILABLE CHANNELS (13 total)
-
-**AIA EUV Imaging (8 channels):**
-- aia94: Hot flare plasma ~6.3 MK (best for solar flares)
-- aia131: Flare plasma + cooler material
-- aia171: Quiet corona ~0.6 MK (coronal loops)
-- aia193: Corona and hot flares ~1.2 MK
-- aia211: Active regions ~2 MK
-- aia304: Chromosphere ~50,000 K
-- aia335: Active regions ~2.5 MK
-- aia1600: Upper photosphere
-
-**HMI Magnetic Field (5 channels):**
-- hmi_m: Total magnetic field magnitude
-- hmi_bx: Magnetic field X component
-- hmi_by: Magnetic field Y component
-- hmi_bz: Magnetic field Z (vertical) - best for sunspot polarity
-- hmi_v: Line-of-sight velocity (Dopplergrams)
-
-## CHANNEL RECOMMENDATIONS
-
-| Use Case | Recommended Channels |
-|----------|---------------------|
-| Solar flares | aia94, aia131 |
-| Corona structure | aia171, aia193 |
-| Active regions | aia211, aia335 |
-| Chromosphere | aia304 |
-| Magnetic field | hmi_bz, hmi_m |
-| Sunspot analysis | hmi_bz, aia1600 |
-
-## METRICS EXPLAINED
-- **MSE**: Mean Squared Error - average of (prediction - ground_truth)^2
-- **RMSE**: Root MSE - square root of MSE, same units as data
-- **MAE**: Mean Absolute Error - average of |prediction - ground_truth|
-- **Bias**: Mean of (prediction - ground_truth) - shows systematic over/under prediction
-
-Be concise and scientifically accurate. When users ask "what can you do" or "what are your capabilities", explain the inference, analysis, and visualization features above."""
-
-    def __init__(self, api_key: str | None = None):
-        self.api_key = api_key or os.environ.get("GROQ_API_KEY")
-        self.model = self.DEFAULT_MODEL
-        self.client = None
-        self.available = False
-        self.error_message = None
-
-        self._init_client()
-
-    def _init_client(self):
-        """Initialize the Groq client."""
-        if not self.api_key:
-            self.error_message = "No API key provided"
-            return
-
-        try:
-            from groq import Groq
-            self.client = Groq(api_key=self.api_key)
-            # Test connection
-            self.client.models.list()
-            self.available = True
-            self.error_message = None
-        except Exception as e:
-            self.error_message = str(e)
-            self.available = False
-
-    def check_connection(self) -> tuple[bool, str]:
-        """Check if Groq is connected and return status message."""
-        if self.available:
-            return True, f"Connected to Groq ({self.model})"
-        return False, f"Disconnected: {self.error_message or 'Unknown error'}"
-
-    def chat(
-        self,
-        message: str,
-        history: list[tuple[str, str]],
-    ) -> Generator[str, None, None]:
-        """Stream a chat response from Groq."""
-        if not self.available:
-            yield f"Groq API not available: {self.error_message}"
-            return
-
-        # Build messages from history
-        messages = [{"role": "system", "content": self.SYSTEM_PROMPT}]
-
-        for user_msg, bot_msg in history:
-            if user_msg:
-                messages.append({"role": "user", "content": user_msg})
-            if bot_msg:
-                messages.append({"role": "assistant", "content": bot_msg})
-
-        messages.append({"role": "user", "content": message})
-
-        try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=0.7,
-                max_tokens=1024,
-                stream=True,
-            )
-
-            full_response = ""
-            for chunk in stream:
-                if chunk.choices[0].delta.content:
-                    full_response += chunk.choices[0].delta.content
-                    yield full_response
-
-        except Exception as e:
-            yield f"Error: {str(e)}"
+Be concise and scientifically accurate."""
 
 
 class SuryaRunner:
@@ -292,14 +161,23 @@ class SuryaRunner:
         return images[:20]
 
 
-# Initialize clients
-groq_client = GroqClient()
+# Initialize clients (model loaded at import time)
+llm_client: LocalLLMClient | None = None
 surya_runner = SuryaRunner()
+
+
+def get_llm_client() -> LocalLLMClient | None:
+    """Return the LLM client singleton (may be None if no model selected)."""
+    return llm_client
 
 
 def get_status_html() -> str:
     """Generate HTML for connection status."""
-    connected, message = groq_client.check_connection()
+    client = get_llm_client()
+    if client is None:
+        connected, message = False, "LLM disabled (no model selected)"
+    else:
+        connected, message = client.check_connection()
 
     if connected:
         status_class = "status-online"
@@ -398,11 +276,12 @@ def process_message(
             ]
         return
 
-    # Regular chat with Groq
-    if not groq_client.available:
+    # Regular chat with local LLM
+    client = get_llm_client()
+    if not client.available:
         yield history + [
             {"role": "user", "content": text},
-            {"role": "assistant", "content": f"⚠️ Groq API unavailable: {groq_client.error_message}"},
+            {"role": "assistant", "content": f"LLM unavailable: {client.error_message}"},
         ]
         return
 
@@ -411,7 +290,7 @@ def process_message(
         {"role": "assistant", "content": ""},
     ]
 
-    for partial_response in groq_client.chat(text, history_tuples):
+    for partial_response in client.chat(text, history_tuples, system=CHAT_SYSTEM_PROMPT):
         yield history + [
             {"role": "user", "content": text},
             {"role": "assistant", "content": partial_response},
@@ -840,7 +719,7 @@ def create_ui() -> gr.Blocks:
                                     <li>Predicts solar observations across <strong>13 channels</strong></li>
                                     <li>Forecasts magnetic field evolution</li>
                                     <li>Multi-step rollout predictions (up to 24+ hours)</li>
-                                    <li>Powered by Groq LLM for natural language interaction</li>
+                                    <li>Local HuggingFace LLM for natural language interaction</li>
                                 </ul>
                             </div>
                         """)
@@ -867,7 +746,7 @@ def create_ui() -> gr.Blocks:
         # Footer
         gr.HTML("""
             <div class="footer">
-                <p>☀️ <strong>Surya Solar Forecasting</strong> • Powered by Groq LLM & Gradio</p>
+                <p>☀️ <strong>Surya Solar Forecasting</strong> • Local LLM & Gradio</p>
                 <p style="font-size: 0.75rem; margin-top: 0.5rem;">NASA SDO Data • 366M Parameter Model</p>
             </div>
         """)
@@ -877,15 +756,45 @@ def create_ui() -> gr.Blocks:
 
 def main():
     """Launch the UI."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Surya Chat UI")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Model name: gpt-oss, gpt-oss-120b, gpt-oss-20b")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="Disable LLM (regex-only mode)")
+    args = parser.parse_args()
+
+    # Determine model to use
+    global llm_client
+    if args.no_llm:
+        model = None
+        reasoning = "medium"
+    elif args.model:
+        model = LocalLLMClient.MODEL_ALIASES.get(args.model, args.model)
+        reasoning = "medium"
+    else:
+        result = select_model()
+        if result is None:
+            model = None
+            reasoning = "medium"
+        else:
+            model, reasoning = result
+
+    if model is not None:
+        llm_client = LocalLLMClient(model=model, reasoning=reasoning)
+    else:
+        llm_client = None
+
     print("\n" + "=" * 60)
-    print("  ☀️  SURYA CHAT UI")
+    print("  SURYA CHAT UI")
     print("=" * 60)
 
-    connected, status = groq_client.check_connection()
-    if connected:
-        print(f"  ✅ Groq API: {status}")
+    if llm_client is not None:
+        connected, status = llm_client.check_connection()
+        print(f"  LLM: {status}")
     else:
-        print(f"  ❌ Groq API: {status}")
+        print("  LLM: OFF (no model selected)")
 
     print("\n  Starting server...")
     print("=" * 60 + "\n")

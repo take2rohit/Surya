@@ -1,283 +1,470 @@
-# Easy Inference
+# SuryaGPT - Solar Forecasting with Natural Language
 
-Use this folder for the simplest Surya flow:
-1. choose date window,
-2. download only required hourly files,
-3. run rollout inference,
-4. save one `prediction.nc`.
+A natural language interface for **Surya**, a 366M-parameter foundation model trained on NASA's Solar Dynamics Observatory (SDO) data. Talk to Surya in plain English — ask questions, run predictions, and analyze results.
 
-## Running Surya
+Powered by **GPT-OSS** (20B / 120B) running locally on GPU with Harmony format streaming.
+
+---
+
+## Quick Start
+
+```bash
+source .venv/bin/activate
+bash easy_inference/surya.sh
+```
+
+Select a model (press Enter for default), then start talking:
+
+```
+SuryaGPT > Run prediction for October 23 2014 at 10am with 5 steps
+```
+
+---
+
+## Interfaces
 
 | Method | Command | Description |
 |--------|---------|-------------|
-| **Web UI** | `python chat_ui.py` | Browser-based chat interface at http://localhost:7860 |
-| **Terminal** | `python llm_interface.py` | Command-line interface with LLM |
-| **Script** | `python run_easy_inference.py` | Direct script execution |
+| **Terminal** | `bash easy_inference/surya.sh` | Interactive CLI with streaming LLM |
+| **Web UI** | `bash easy_inference/run_chat_ui.sh` | Browser chat + image gallery at localhost:7860 |
+| **Script** | `bash easy_inference/run_easy_inference.sh` | Direct inference (no LLM) |
 
-## Quick start
+---
 
-```bash
-source .venv/bin/activate
-bash easy_inference/run_easy_inference.sh
+## Agent Architecture
+
+SuryaGPT uses a multi-agent pipeline. Every user query first goes through the **Intent Agent**, which classifies it into one of four intents. Each intent triggers a different workflow through specialized agents.
+
+### Master Flow
+
 ```
-
-Non-interactive defaults:
-
-```bash
-bash easy_inference/run_easy_inference.sh --no-prompt
+                          ┌─────────────────────┐
+                          │     User Input       │
+                          └──────────┬──────────┘
+                                     │
+                                     ▼
+                          ┌─────────────────────┐
+                          │    Intent Agent      │
+                          │  (classifies query)  │
+                          └──────────┬──────────┘
+                                     │
+                  ┌──────────────────┼──────────────────┐
+                  │                  │                   │
+                  ▼                  ▼                   ▼
+          ┌───────────┐     ┌──────────────┐    ┌──────────────┐
+          │ INFERENCE  │     │   ANALYSIS   │    │ QUESTION /   │
+          │            │     │              │    │ CHAT         │
+          └─────┬─────┘     └──────┬───────┘    └──────┬───────┘
+                │                  │                    │
+                ▼                  ▼                    ▼
+        Params Agent        run_analysis()       Response Agent
+                │                  │                    │
+                ▼                  ▼                    ▼
+     ┌──── complete? ────┐   analyze_predictions.py   Green answer
+     │                   │                             to user
+    YES                  NO
+     │                   │
+     ▼                   ▼
+  Surya Model      Follow-up Agent
+  (inference)      (asks for missing info)
+     │                   │
+     ▼                   ▼
+  prediction.nc    Pending state
+                   (waits for next input)
 ```
 
 ---
 
-## Web Chat UI
+### INFERENCE Flow (detailed)
 
-A modern web interface with chat, image gallery, and inference controls powered by Groq LLM.
-
-### Quick Start
-
-```bash
-source .venv/bin/activate
-python chat_ui.py
-```
-
-Then open http://localhost:7860 in your browser.
-
-### Features
-
-- **Chat Interface**: Ask questions about solar physics, channels, and predictions
-- **Run Inference**: Type "run prediction for 2014-10-23" or use the Inference tab
-- **Image Gallery**: View generated prediction images
-- **Streaming Responses**: Real-time LLM responses via Groq API
-
-### Commands in Chat
-
-| Command | Example |
-|---------|---------|
-| Run inference | `run prediction for 2014-10-23 12:00` |
-| With rollout | `forecast 2014-10-23 with 4 steps` |
-| Show images | `show latest images` |
-| Questions | `what channel shows solar flares?` |
-
-### Configuration
-
-Set your Groq API key in `.env`:
+When the Intent Agent classifies a query as `INFERENCE`, the system extracts parameters and validates them before running the model.
 
 ```
-GROQ_API_KEY=your_api_key_here
+┌──────────────────────────────────────────────────────────────────────┐
+│ INFERENCE FLOW                                                       │
+│                                                                      │
+│  User: "predict october 23 2014 at 10am with 3 steps"              │
+│                                                                      │
+│  1. Intent Agent ──────────────────────────────────────► INFERENCE   │
+│                                                                      │
+│  2. Params Agent ──────────────────────────────────────► JSON        │
+│     Extracts: date, year, time, rollout                             │
+│     Output: {"start_datetime": "2014-10-23 10:00",                  │
+│              "rollout_steps": 3, "missing": []}                     │
+│                                                                      │
+│  3. Validation ────────────────────────────────────────► Check       │
+│     ├─ Has date?  ✓                                                 │
+│     ├─ Has year?  ✓                                                 │
+│     ├─ Has time?  ✓                                                 │
+│     └─ missing == [] ?  ✓                                           │
+│                                                                      │
+│  4. Show Inference Plan:                                            │
+│     Step 1/4  [GT Oct 23 09:00, GT Oct 23 10:00] -> Pred Oct 23 11 │
+│     Step 2/4  [GT Oct 23 10:00, Pred Oct 23 11:00] -> Pred Oct 23  │
+│     Step 3/4  [Pred Oct 23 11:00, Pred Oct 23 12:00] -> Pred ...   │
+│     Step 4/4  [Pred Oct 23 12:00, Pred Oct 23 13:00] -> Pred ...   │
+│                                                                      │
+│  5. Execute: run_easy_inference.py                                  │
+│     └─► prediction.nc                                               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### INFERENCE Flow — Missing Parameters
+
+When required info is missing, the Follow-up Agent asks and the system waits:
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ INFERENCE FLOW (incomplete query)                                    │
+│                                                                      │
+│  User: "run prediction for October 23"                              │
+│                                                                      │
+│  1. Intent Agent ──────────────────────────────────────► INFERENCE   │
+│                                                                      │
+│  2. Params Agent ──────────────────────────────────────► JSON        │
+│     Output: {"start_datetime": null,                                │
+│              "missing": ["year", "time"]}                           │
+│                                                                      │
+│  3. Validation ────────────────────────────────────────► FAIL        │
+│     ├─ Has year?  ✗                                                 │
+│     └─ Has time?  ✗                                                 │
+│                                                                      │
+│  4. Follow-up Agent ───────────────────────────────────► Question    │
+│     "I need the year and start time! e.g. '2014 at 10am'"          │
+│                                                                      │
+│  5. Save pending state (original_cmd + partial params)              │
+│                                                                      │
+│  ─── Next user input ───                                            │
+│                                                                      │
+│  User: "2014 at 10am with 3 steps"                                 │
+│                                                                      │
+│  6. Combine: "run prediction for October 23" + "2014 at 10am ..."  │
+│  7. Params Agent re-extracts ──────────────────────────► Complete    │
+│  8. Execute inference                                               │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### ANALYSIS Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ ANALYSIS FLOW                                                        │
+│                                                                      │
+│  User: "analyze all channels and rank by MSE"                       │
+│                                                                      │
+│  1. Intent Agent ──────────────────────────────────────► ANALYSIS    │
+│                                                                      │
+│  2. Keyword parsing (no LLM needed):                                │
+│     ├─ "all" in query?  → --all-channels                            │
+│     ├─ "rank" in query? → --rank-channels                           │
+│     ├─ "mse"/"trend"?   → --show-mse-trend                         │
+│     └─ channel name?    → --channel <name>                          │
+│                                                                      │
+│  3. Find latest prediction.nc in outputs_*/                         │
+│                                                                      │
+│  4. Execute: analyze_predictions.py                                 │
+│     └─► comparison_*.png, mse_trend.png, channel ranking            │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### QUESTION / CHAT Flow
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│ QUESTION / CHAT FLOW                                                 │
+│                                                                      │
+│  User: "What channel shows solar flares?"                           │
+│                                                                      │
+│  1. Intent Agent ──────────────────────────────────────► QUESTION    │
+│                                                                      │
+│  2. Response Agent                                                  │
+│     ├─ System prompt: prompts/system_prompt.txt                     │
+│     ├─ Conversation history (up to 20 turns)                        │
+│     └─ Streams: [thinking] gray... [/thinking]                      │
+│                  Green final answer                                  │
+│                                                                      │
+│  3. Save to conversation history for context                        │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Terminal Interface (No UI)
+## Agents Reference
 
-A terminal-based interface for running predictions and analysis without a web browser.
+### Intent Agent
 
-### Usage
+| | |
+|---|---|
+| **Prompt file** | `prompts/intent_agent.txt` |
+| **Input** | Raw user query |
+| **Output** | One word: `INFERENCE`, `ANALYSIS`, `QUESTION`, or `CHAT` |
+| **Color** | Light gray (thinking + output) |
+| **Streaming** | Yes |
+
+### Params Agent
+
+| | |
+|---|---|
+| **Prompt file** | `prompts/params_agent.txt` |
+| **Input** | User query (inference requests only) |
+| **Output** | JSON: `{start_datetime, rollout_steps, missing, understood}` |
+| **Color** | Light gray (thinking + output) |
+| **Streaming** | Yes |
+| **Retries** | Up to 2 attempts if JSON parse fails |
+
+### Follow-up Agent
+
+| | |
+|---|---|
+| **Prompt file** | `prompts/followup_agent.txt` |
+| **Input** | Original query + what was understood + list of missing fields |
+| **Output** | Friendly question asking for missing info |
+| **Color** | Light gray (thinking + output) |
+| **Streaming** | Yes |
+| **Triggers** | Only when Params Agent reports missing required fields |
+
+### Response Agent
+
+| | |
+|---|---|
+| **Prompt file** | `prompts/system_prompt.txt` (system) + `prompts/response_agent.txt` (pre-inference) |
+| **Input** | User question + conversation history (up to 20 turns) |
+| **Output** | Natural language answer |
+| **Color** | Green final answer, gray thinking |
+| **Streaming** | Yes |
+| **Used for** | QUESTION and CHAT intents |
+
+---
+
+## Required Parameters for Inference
+
+All three are **mandatory**. If any is missing, the Follow-up Agent will ask.
+
+| Parameter | Required | Examples | What happens if missing |
+|-----------|----------|---------|------------------------|
+| **Date** | Yes | "october 23", "may 20", "2020-05-20" | Follow-up asks for date |
+| **Year** | Yes | "2014", "twenty twenty" | Follow-up asks for year |
+| **Start time** | Yes | "at 10am", "14:00", "noon" | Follow-up asks for time |
+| **Rollout steps** | No | "5 steps", "10 hours ahead" | Defaults to 0 (single 1-hour prediction) |
+
+---
+
+## Prompt Files
+
+All agent prompts live in `easy_inference/prompts/` and can be edited without touching code:
+
+```
+easy_inference/prompts/
+├── intent_agent.txt      # Intent classification prompt
+├── params_agent.txt      # Date/time/rollout extraction prompt
+├── followup_agent.txt    # Missing-info follow-up question prompt
+├── response_agent.txt    # Pre-inference response generation prompt
+└── system_prompt.txt     # System prompt for Response Agent (chat/questions)
+```
+
+---
+
+## Streaming Output Format
+
+All agents stream their output to the terminal with color coding:
+
+```
+[Agent Name] [thinking] <gray analysis text> [/thinking]
+<final output in agent's color>
+```
+
+| Element | Color | ANSI Code |
+|---------|-------|-----------|
+| Agent tag `[Intent Agent]` | Dark gray | `\033[90m` |
+| `[thinking]` content | Dark gray | `\033[90m` |
+| Intent/Params/Follow-up final output | Light gray | `\033[37m` |
+| Response Agent final output | Green | `\033[32m` |
+
+**Example terminal session:**
+```
+SuryaGPT > What channel shows solar flares?
+
+[Intent Agent] [thinking] classifying user intent [/thinking]
+QUESTION
+[Response Agent] [thinking] looking up channel info [/thinking]
+For solar flares, aia94 (94Å) is the best channel. It captures hot
+flare plasma at ~6.3 million Kelvin...
+```
+
+---
+
+## Example Queries
+
+### Inference
+```
+"Run prediction for october 23 2014 at 10am"
+"Predict 10 hours ahead starting at noon on 2020-05-20"
+"Forecast the X1.6 flare day at 14:00 with 5 rollout steps"
+"Show me what happens on october 12 2016 at 8pm"
+"2014-10-23 14:00 with 3 steps, skip download"
+```
+
+### Analysis
+```
+"Analyze the latest predictions"
+"Compare all channels and rank by MSE"
+"Show me the MSE trend for aia94"
+"Which channel does the model predict best?"
+"How does prediction accuracy change over time?"
+```
+
+### Questions
+```
+"What channel shows solar flares?"
+"Tell me about the AIA 94 angstrom wavelength"
+"What's the difference between hmi_bz and hmi_m?"
+"How does the model work?"
+"What data does Surya use?"
+```
+
+---
+
+## Model Selection
+
+On startup, SuryaGPT shows an interactive model menu:
+
+```
+  Available Modes:
+  ----------------------------------------------------------------------
+    #  Model          Reasoning  Description              Cached
+  ----------------------------------------------------------------------
+    1  GPT-OSS-20B    low        Fast, single GPU                  (default)
+    2  GPT-OSS-20B    medium     Balanced, single GPU
+    3  GPT-OSS-20B    high       Deep reasoning, single GPU
+    4  GPT-OSS-120B   low        Fast, minimal thinking
+    5  GPT-OSS-120B   medium     Balanced
+    6  GPT-OSS-120B   high       Deep reasoning
+  ----------------------------------------------------------------------
+    0 / q  = No LLM (regex mode)
+
+  Select mode [1]:
+```
+
+| Model | Size | GPUs | Best For |
+|-------|------|------|----------|
+| GPT-OSS-20B | ~20B params | 1 GPU | Fast responses, interactive use |
+| GPT-OSS-120B | ~120B params | Multi-GPU | Complex reasoning, detailed analysis |
+
+| Reasoning | Thinking Depth | Speed |
+|-----------|---------------|-------|
+| low | Minimal internal analysis | Fastest |
+| medium | Balanced thinking | Moderate |
+| high | Deep multi-step reasoning | Slowest |
+
+CLI flags to skip the menu:
 
 ```bash
-# Interactive mode
-./easy_inference/surya.sh
-
-# Or directly
-source .venv/bin/activate
-python easy_inference/llm_interface.py
-
-# Disable LLM (regex-only)
-python easy_inference/llm_interface.py --no-llm
+python llm_interface.py --model gpt-oss-20b --reasoning low
+python llm_interface.py --model gpt-oss-120b --reasoning high
+python llm_interface.py --no-llm    # Regex-only, no GPU for LLM
 ```
 
-### Architecture
+---
+
+## Channels
+
+### AIA — Extreme Ultraviolet (8 channels)
+
+| Channel | Wavelength | Temperature | Best For |
+|---------|-----------|-------------|----------|
+| `aia94` | 94 Å | ~6.3 MK | **Solar flares**, hot plasma |
+| `aia131` | 131 Å | ~10 MK + 0.4 MK | Flare plasma + cooler regions |
+| `aia171` | 171 Å | ~0.6 MK | Quiet corona, coronal loops |
+| `aia193` | 193 Å | ~1.6 MK | Corona + hot flares (general purpose) |
+| `aia211` | 211 Å | ~2 MK | Active regions |
+| `aia304` | 304 Å | ~50,000 K | Chromosphere, prominences |
+| `aia335` | 335 Å | ~2.5 MK | Active regions |
+| `aia1600` | 1600 Å | — | Upper photosphere, UV continuum |
+
+### HMI — Magnetic Field (5 channels)
+
+| Channel | Measures |
+|---------|----------|
+| `hmi_m` | Total magnetic field magnitude |
+| `hmi_bx` | Magnetic field X component |
+| `hmi_by` | Magnetic field Y component |
+| `hmi_bz` | Magnetic field Z (vertical) |
+| `hmi_v` | Line-of-sight velocity (Doppler) |
+
+---
+
+## Inference Progress Output
+
+During inference, each step shows human-readable input/output with MSE:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      User Input                              │
-└──────────────────────────┬──────────────────────────────────┘
-                           │
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    SuryaInterface                            │
-│                                                              │
-│   ┌─────────────┐          ┌─────────────────────────────┐  │
-│   │  Question?  │───YES───►│  LLMHelper (Ollama API)     │  │
-│   │  (ends ?)   │          │  llama3.2:1b / qwen2.5      │  │
-│   └──────┬──────┘          └─────────────────────────────┘  │
-│          │ NO                                                │
-│          ▼                                                   │
-│   ┌─────────────────────────────────────────────────────┐   │
-│   │              DateParser (Regex)                      │   │
-│   │  "oct 23 2014 from 1pm to 5pm" → 2014-10-23 13:00   │   │
-│   │  "2 steps" → rollout_steps=2                         │   │
-│   └──────────────────────────┬──────────────────────────┘   │
-│                              │                               │
-│          ┌───────────────────┼───────────────────┐          │
-│          ▼                   ▼                   ▼          │
-│   run_inference()     run_analysis()      show_help()       │
-└──────────┬───────────────────┬──────────────────────────────┘
-           │                   │
-           ▼                   ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   Subprocess Calls                           │
-│                                                              │
-│   python run_easy_inference.py     python analyze_predictions.py
-│     --start-datetime ...             --prediction-nc ...    │
-│     --end-datetime ...               --all-channels         │
-│     --rollout-steps N                --rank-channels        │
-└─────────────────────────────────────────────────────────────┘
+[progress] Step 1/4  [GT Oct 23 10:00, GT Oct 23 11:00] -> Pred Oct 23 12:00  MSE=5351.09
+[progress] Step 2/4  [GT Oct 23 11:00, Pred Oct 23 12:00] -> Pred Oct 23 13:00  MSE=5374.81
+[progress] Step 3/4  [Pred Oct 23 12:00, Pred Oct 23 13:00] -> Pred Oct 23 14:00  MSE=5436.44
+[progress] Step 4/4  [Pred Oct 23 13:00, Pred Oct 23 14:00] -> Pred Oct 23 15:00  MSE=5448.03
 ```
 
-### How It Works
+- **GT** = Ground Truth (real observed SDO data used as input)
+- **Pred** = Model Prediction (autoregressive — feeds back into next step)
+- MSE increases with each step as prediction errors compound
 
-**1. Input Classification**
+---
 
-| Input Type | Detection | Handler |
-|------------|-----------|---------|
-| Questions | Ends with `?` or starts with `what/how/why` | LLM |
-| Inference | Contains `run`, `predict`, `forecast` | Regex |
-| Analysis | Contains `analyze`, `mse`, `rank` | Regex |
-| Unknown | Fallback | LLM |
-
-**2. LLM Integration**
-
-Uses Ollama HTTP API at `localhost:11434`:
+## Output Files
 
 ```
-POST /api/generate
-{
-  "model": "llama3.2:1b",
-  "prompt": "user question",
-  "system": "You are a helpful assistant for Surya...",
-  "stream": false
-}
+easy_inference/outputs_24h/
+├── prediction.nc           # NetCDF: predictions + ground truth for all 13 channels
+├── comparison_aia94.png    # Side-by-side: GT vs Prediction vs Difference
+├── comparison_*.png        # Per-channel comparison plots
+└── mse_trend.png           # MSE over prediction steps (all channels)
 ```
 
-Model auto-selection order:
-1. `llama3.2:1b` (1.3 GB) - recommended
-2. `qwen2.5:1.5b` (~1 GB)
-3. `qwen2.5:0.5b` (397 MB) - fastest
+## Session Logging
 
-**3. Date/Time Parsing**
-
-Regex extracts dates, times, and rollout steps:
-
-| Input | Result |
-|-------|--------|
-| `oct 23 2014` | `2014-10-23` |
-| `from 1pm to 5pm` | `13:00` to `17:00` |
-| `2 steps` | `rollout_steps=2` |
-
-### Example Session
-
-```
-[surya] > what channel shows solar flares?
-  [Thinking...]
-
-For solar flares, use aia94 (94Å) which captures hot flare plasma at ~6.3 MK.
-
-[surya] > predict oct 23 2014 from 1pm to 5pm with 2 steps
-  Start: 2014-10-23 13:00
-  End: 2014-10-23 17:00
-  Rollout steps: 2
-
->>> Executing inference...
->>> Inference completed successfully!
-
-[surya] > analyze all channels and rank by mse
-
-CHANNEL RANKING (by average MSE)
-========================================
-Rank   Channel      Avg MSE
----------------------------------
-1      aia94        0.744463
-2      aia335       2.439224
-...
-
-[surya] > exit
-```
-
-### Output Files
-
-```
-outputs_24h/
-├── prediction.nc           # Predictions + ground truth
-├── comparison_aia94.png    # GT vs Pred vs Diff maps
-├── comparison_*.png        # Per-channel comparisons
-└── mse_trend.png           # MSE over prediction steps
-```
-
-### Session Logging
-
-Commands logged to `logs/session_*.log` (JSON lines):
+All commands and responses are logged to `easy_inference/logs/session_*.log` (JSON lines):
 
 ```json
-{"timestamp": "...", "event": "command", "input": "predict oct 23 2014"}
-{"timestamp": "...", "event": "llm_response", "input": "...", "response": "..."}
+{"timestamp": "2024-10-23T14:30:00", "event": "command", "input": "predict oct 23 2014 at 10am"}
+{"timestamp": "2024-10-23T14:30:05", "event": "inference_start", "start_datetime": "2014-10-23 10:00"}
+{"timestamp": "2024-10-23T14:31:12", "event": "inference_end", "returncode": 0}
 ```
 
 ---
 
-## Config
+## Configuration
 
-Edit `easy_inference/config_easy.yaml`.
+Edit `easy_inference/config_easy.yaml`:
 
-- Normal users: edit only the top `user:` section.
-- Advanced users: optional changes in `advanced:`.
-
-Default and override behavior:
-
-```bash
-# Uses easy_inference/config_easy.yaml by default.
-python easy_inference/run_easy_inference.py
-
-# Optional: use a different YAML file.
-python easy_inference/run_easy_inference.py --config-path /path/to/custom_easy.yaml
+```yaml
+user:
+  start_datetime: "2014-10-23 10:00:00"
+  end_datetime: ""          # Leave empty to auto-calculate
+  output_dir: easy_inference/outputs_24h
+  rollout_steps: 5
 ```
 
-### Debug mode
+### Debug Mode
 
-Set in `advanced:`:
-- `debug_mode: true`
-- optional `debug_log_path: "path/to/inference_debug.txt"` (default is `<user.output_dir>/inference_debug.txt`)
-
-When enabled, the text log contains stage timings and per-step diagnostics with line number + UTC timestamp:
-- input file read / transform timing
-- GT file read timing
-- per-step forward / CPU-copy / inverse-transform / write timing
-- per-step memory stats (`CUDA` peak/allocated/reserved when available)
+```yaml
+advanced:
+  debug_mode: true
+  debug_log_path: "easy_inference/inference_debug.txt"
+```
 
 ---
 
-## Available Channels
+## Dependencies
 
-### AIA (8 channels)
-| Channel | Wavelength | Best For |
-|---------|------------|----------|
-| aia94 | 94Å | Solar flares |
-| aia131 | 131Å | Flares + cooler |
-| aia171 | 171Å | Quiet corona |
-| aia193 | 193Å | Corona, flares |
-| aia211 | 211Å | Active regions |
-| aia304 | 304Å | Chromosphere |
-| aia335 | 335Å | Active regions |
-| aia1600 | 1600Å | Upper photosphere |
-
-### HMI (5 channels)
-| Channel | Description |
-|---------|-------------|
-| hmi_m | Magnetic field magnitude |
-| hmi_bx | Magnetic field X |
-| hmi_by | Magnetic field Y |
-| hmi_bz | Magnetic field Z (vertical) |
-| hmi_v | Line-of-sight velocity |
-
----
-
-## Metrics Notebook
-
-Use `easy_inference/compare_prediction_groundtruth.ipynb` to compare `prediction.nc` vs GT and compute:
-- overall metrics (`MSE`, `RMSE`, `MAE`, `bias`, `max_abs_error`)
-- per-channel metrics
-- per-step metrics
-- visual prediction vs ground-truth plots
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `torch` | 2.8.0 | Model inference with `torch.compile` |
+| `triton` | 3.4.0 | Inductor backend (must match torch) |
+| `kernels` | 0.12+ | MXFP4 quantization kernels for GPT-OSS |
+| `transformers` | latest | GPT-OSS model loading (HuggingFace) |
+| `openai_harmony` | latest | Harmony format streaming for GPT-OSS |
+| `gradio` | latest | Web chat UI |
+| `xarray`, `h5netcdf` | latest | NetCDF prediction output |
 
 ---
 
@@ -285,11 +472,13 @@ Use `easy_inference/compare_prediction_groundtruth.ipynb` to compare `prediction
 
 | File | Purpose |
 |------|---------|
+| `llm_interface.py` | Terminal interface with multi-agent LLM pipeline |
 | `chat_ui.py` | Web chat interface (Gradio) |
-| `llm_interface.py` | Terminal interface |
-| `run_easy_inference.py` | Core inference script |
-| `analyze_predictions.py` | Standalone analysis script |
-| `config_easy.yaml` | Configuration |
-| `.env` | API keys (not committed) |
-| `logs/` | Session logs |
-| `outputs_*/` | Outputs and plots |
+| `run_easy_inference.py` | Core Surya inference engine |
+| `analyze_predictions.py` | Post-inference analysis and visualization |
+| `config_easy.yaml` | User + advanced configuration |
+| `prompts/` | All agent prompt files (editable without code changes) |
+| `surya.sh` | Launch script (terminal) |
+| `run_llm_interface.sh` | Launch script (terminal, activates venv) |
+| `run_chat_ui.sh` | Launch script (web UI) |
+| `run_easy_inference.sh` | Launch script (direct inference) |
