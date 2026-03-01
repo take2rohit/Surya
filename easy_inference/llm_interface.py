@@ -155,6 +155,9 @@ class LocalLLMClient:
 
     REASONING_LEVELS = ("low", "medium", "high")
 
+    # Reserve tokens for generation output
+    _GENERATION_RESERVE = 1024
+
     def __init__(self, model: str | None = None, reasoning: str = "medium"):
         resolved = self.MODEL_ALIASES.get(model, model) if model else None
         self.model = resolved or self.DEFAULT_MODEL
@@ -164,6 +167,7 @@ class LocalLLMClient:
         self._tokenizer = None
         self._model = None
         self._harmony_enc = None
+        self.context_window: int = 0  # max tokens the model supports
         self._load_model()
 
     def _load_model(self):
@@ -188,8 +192,15 @@ class LocalLLMClient:
                 HarmonyEncodingName.HARMONY_GPT_OSS
             )
 
+            # Read context window from model config
+            cfg = self._model.config
+            self.context_window = getattr(
+                cfg, "max_position_embeddings",
+                getattr(cfg, "n_positions", getattr(cfg, "seq_length", 4096)),
+            )
+
             self.available = True
-            print("OK")
+            print(f"OK (context: {self.context_window} tokens)")
 
         except Exception as e:
             self.error_message = str(e)
@@ -265,14 +276,19 @@ class LocalLLMClient:
 
         streamer.put = _put_with_harmony
 
+    def count_tokens(self, text: str) -> int:
+        """Count tokens in a string using the loaded tokenizer."""
+        if not self._tokenizer:
+            return len(text) // 4  # rough fallback
+        return len(self._tokenizer.encode(text, add_special_tokens=False))
+
     def _build_messages(
         self,
         prompt: str,
         system: str = "",
         history: list[tuple[str, str]] | None = None,
     ) -> list[dict]:
-        """Build HF chat messages list with reasoning effort in system message."""
-        messages = []
+        """Build HF chat messages list, trimming history to fit context window."""
         sys_content = (
             f"Reasoning: {self.reasoning}\n\n"
             "# Valid channels: analysis, commentary, final. "
@@ -280,13 +296,30 @@ class LocalLLMClient:
         )
         if system:
             sys_content += f"\n\n{system}"
-        messages.append({"role": "system", "content": sys_content})
+
+        # Token budget: context_window - generation reserve
+        max_input_tokens = self.context_window - self._GENERATION_RESERVE
+        # Count fixed tokens (system + current prompt)
+        fixed_tokens = self.count_tokens(sys_content) + self.count_tokens(prompt) + 20  # overhead
+
+        # Trim history from oldest to fit within budget
+        trimmed_history: list[tuple[str, str]] = []
         if history:
-            for user_msg, bot_msg in history:
-                if user_msg:
-                    messages.append({"role": "user", "content": user_msg})
-                if bot_msg:
-                    messages.append({"role": "assistant", "content": bot_msg})
+            history_tokens = 0
+            # Walk from newest to oldest, accumulate tokens
+            for user_msg, bot_msg in reversed(history):
+                pair_tokens = self.count_tokens(user_msg or "") + self.count_tokens(bot_msg or "") + 10
+                if fixed_tokens + history_tokens + pair_tokens > max_input_tokens:
+                    break
+                history_tokens += pair_tokens
+                trimmed_history.insert(0, (user_msg, bot_msg))
+
+        messages = [{"role": "system", "content": sys_content}]
+        for user_msg, bot_msg in trimmed_history:
+            if user_msg:
+                messages.append({"role": "user", "content": user_msg})
+            if bot_msg:
+                messages.append({"role": "assistant", "content": bot_msg})
         messages.append({"role": "user", "content": prompt})
         return messages
 
@@ -1187,6 +1220,15 @@ HMI (Helioseismic and Magnetic Imager):
         venv_active = sys.prefix != sys.base_prefix
         print(f"Virtual env active: {'Yes' if venv_active else 'No'}")
         print(f"LLM available: {'Yes' if self.llm and self.llm.available else 'No'}")
+        if self.llm and self.llm.available:
+            print(f"  Model: {self.llm.model}")
+            print(f"  Reasoning: {self._reasoning}")
+            print(f"  Context window: {self.llm.context_window:,} tokens")
+            hist_tokens = sum(
+                self.llm.count_tokens(u or "") + self.llm.count_tokens(b or "")
+                for u, b in self.conversation_history
+            )
+            print(f"  History: {len(self.conversation_history)} turns ({hist_tokens:,} tokens)")
         print(f"Config exists: {'Yes' if CONFIG_PATH.exists() else 'No'}")
 
         output_dirs = list(EASY_DIR.glob("outputs_*"))
